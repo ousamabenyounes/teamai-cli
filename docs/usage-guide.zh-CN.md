@@ -111,16 +111,29 @@ teamai init <group>/TeamAi-<team>
 生成的目录结构：
 
 ```
-/path/to/my-project/
-├── .teamai/                     # 项目级配置（含自动生成的 .gitignore）
-│   ├── config.yaml
-│   └── team-repo/
+/path/to/my-project/          # 你的业务仓库 —— 零 teamai 残留
 ├── .claude/skills/              # 项目级 skills（自动同步）
 ├── .claude/rules/               # 项目级 rules（自动同步）
 └── src/
+
+~/.teamai/projects/my-project-<hash>/   # 本项目的机器数据分区
+├── config.yaml
+├── state.json
+└── team-repo/                           # 团队仓库克隆
 ```
 
-`teamai init` 只写入 `.teamai/`。各 Agent 的项目根目录（`.claude/`、`.cursor/`、`.codebuddy/` 等）会在 **SessionStart** 时按刚打开的工具创建（`--tool claude` 会建 `.claude/`，再 pull 写入）。单独执行 `teamai pull` 仍会跳过项目里还不存在根目录的工具，因此不会给尚未在本项目打开过的 Agent 凭空建目录。
+项目的机器数据（config、state、team-repo 克隆、搜索索引、MCP manifest、资源缓存）
+存放在 `~/.teamai/projects/<slug>/` 下的按项目分区里，**不再**放进业务仓库，因此工作区
+无 teamai 残留，且同一仓库的 `git worktree` 共享同一分区。各 Agent 的项目根目录
+（`.claude/`、`.cursor/`、`.codebuddy/` 等）仍在工作区内、于 **SessionStart** 时按刚打开的
+工具创建（`--tool claude` 会建 `.claude/`，再 pull 写入）。单独执行 `teamai pull` 仍会跳过
+项目里还不存在根目录的工具，因此不会给尚未在本项目打开过的 Agent 凭空建目录。
+
+> **从旧版 teamai 升级？** 升级后首次执行 `teamai init` / `pull` / `push` 会自动把已有的
+> `<repo>/.teamai/` 迁移进分区（复制 → 校验 → 原子切换），并把旧目录保留为
+> `<repo>/.teamai.bak/`，待你确认一切正常后自行删除。只读命令与 `hook-dispatch` 路径
+> 永不触发迁移；`teamai --dry-run pull` 可预演。**迁移后不支持降级**——旧版会把项目判定为
+> 未初始化；`.teamai.bak/` 是人工回滚路径。
 
 如果仓库启用了角色化 skills（存在 `manifest/roles.yaml`），`teamai init` 还会交互式要求你选择：
 
@@ -136,7 +149,7 @@ teamai init <group>/TeamAi-<team> --scope project --role hai_dev --force
 | 参数 | 说明 |
 |------|------|
 | `[repo]` / `--repo <url>` | 团队仓库地址（推荐位置参数；`--repo` 为永久别名） |
-| `--scope <project\|user>` | 安装作用域，默认 `project`（`<cwd>/.teamai`）。需要装到 `~/` 时用 `user` |
+| `--scope <project\|user>` | 安装作用域，默认 `project`（机器数据在 `~/.teamai/projects/<slug>/`,资源落在 `<cwd>`）。需要装到 `~/` 时用 `user` |
 | `--inherit-user-scope` | 仅 project scope：同时同步安全的 user 资源并检索 user 知识 |
 | `--no-inherit-user-scope` | 关闭当前项目先前配置的 user scope 继承 |
 | `--role <id>` | 直接指定 primaryRole，跳过角色交互选择 |
@@ -146,11 +159,11 @@ teamai init <group>/TeamAi-<team> --scope project --role hai_dev --force
 
 ```yaml
 repo:
-  localPath: /path/to/my-project/.teamai/team-repo
+  localPath: ~/.teamai/projects/my-project-<hash>/team-repo
   remote: https://git.woa.com/group/repo.git
 username: alice
 scope: project
-projectRoot: /path/to/my-project
+projectRoot: /path/to/my-project   # 资源落地位置（当前 checkout）
 inheritUserScope: true            # 可选，仅 project scope
 primaryRole: hai
 additionalRoles:

@@ -2,7 +2,13 @@ import { createRequire } from 'node:module';
 import { Command, Option } from 'commander';
 import { setVerbose, setSilent, log } from './utils/logger.js';
 import type { GlobalOptions } from './types.js';
+import { TEAMAI_HOOK_SUBCOMMANDS } from './hooks.js';
 import { registerPackagesCommand } from './pkg/register-command.js';
+
+// Commands that migrate a legacy `<repo>/.teamai/` into the partition on first
+// run (issue #374 P1-3). Only write commands trigger it; read-only commands rely
+// on the double-read fallback, and hook-dispatch is excluded outright (see below).
+const MIGRATION_TRIGGER_COMMANDS = new Set(['init', 'pull', 'push']);
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json');
@@ -15,9 +21,20 @@ program
   .version(version)
   .option('--dry-run', 'Preview mode, no changes made')
   .option('-v, --verbose', 'Verbose output')
-  .hook('preAction', (thisCommand) => {
+  .hook('preAction', async (thisCommand, actionCommand) => {
     const opts = thisCommand.opts();
     if (opts.verbose) setVerbose(true);
+
+    // Auto-migrate a legacy `<repo>/.teamai/` into the partition before the
+    // command runs, so init/pull/push (and every path resolver they call) see
+    // the migrated layout. Narrowed twice: hook-dispatch is a high-frequency
+    // silent path that must never move 12MB, and only write commands trigger a
+    // move (read-only commands use the double-read fallback). Dry-run previews.
+    const name = actionCommand.name();
+    if (TEAMAI_HOOK_SUBCOMMANDS.includes(name as (typeof TEAMAI_HOOK_SUBCOMMANDS)[number])) return;
+    if (!MIGRATION_TRIGGER_COMMANDS.has(name)) return;
+    const { maybeMigrate } = await import('./migrate.js');
+    await maybeMigrate({ dryRun: !!opts.dryRun });
   });
 
 program

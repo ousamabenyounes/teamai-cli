@@ -113,16 +113,34 @@ teamai init <group>/TeamAi-<team>
 Resulting directory structure:
 
 ```
-/path/to/my-project/
-├── .teamai/                     # Project-level config (with an auto-generated .gitignore)
-│   ├── config.yaml
-│   └── team-repo/
+/path/to/my-project/          # your business repo — ZERO teamai residue
 ├── .claude/skills/              # Project-level skills (auto-synced)
 ├── .claude/rules/               # Project-level rules (auto-synced)
 └── src/
+
+~/.teamai/projects/my-project-<hash>/   # this project's machine-data partition
+├── config.yaml
+├── state.json
+└── team-repo/                           # clone of the team repo
 ```
 
-`teamai init` writes `.teamai/` only. Per-agent project roots (`.claude/`, `.cursor/`, `.codebuddy/`, …) are created on **SessionStart** for the tool that just opened (`--tool claude` creates `.claude/`, then pull writes into it). A bare `teamai pull` still skips tools whose project root does not exist, so it never invents agent directories for tools you have not opened in this project.
+Project machine-data (config, state, the team-repo clone, search index, MCP
+manifests, resource cache) lives in a per-project partition under
+`~/.teamai/projects/<slug>/`, **not** in the business repo, so your workspace has no
+teamai residue and a `git worktree` of the same repo shares one partition. Per-agent
+project roots (`.claude/`, `.cursor/`, `.codebuddy/`, …) are still created inside the
+workspace on **SessionStart** for the tool that just opened (`--tool claude` creates
+`.claude/`, then pull writes into it). A bare `teamai pull` still skips tools whose
+project root does not exist, so it never invents agent directories for tools you have
+not opened in this project.
+
+> **Upgrading from an older teamai?** The first `teamai init` / `pull` / `push` after
+> upgrading automatically migrates an existing `<repo>/.teamai/` into the partition
+> (copy → verify → atomic switch), then leaves the old directory as `<repo>/.teamai.bak/`
+> for you to delete once you've confirmed everything works. Read-only commands and the
+> `hook-dispatch` path never migrate; `teamai --dry-run pull` previews the move.
+> **Downgrading afterwards is not supported** — an older teamai would treat the project
+> as uninitialized; `.teamai.bak/` is the manual rollback path.
 
 If the repo has role-based skills enabled (i.e. `manifest/roles.yaml` exists), `teamai init` will also interactively ask you to choose:
 
@@ -138,7 +156,7 @@ teamai init <group>/TeamAi-<team> --scope project --role hai_dev --force
 | Flag | Description |
 |------|------|
 | `[repo]` / `--repo <url>` | Team repo URL (positional preferred; `--repo` is a permanent alias) |
-| `--scope <project\|user>` | Install scope, defaults to `project` (`<cwd>/.teamai`). Use `user` for `~/` |
+| `--scope <project\|user>` | Install scope, defaults to `project` (machine-data in `~/.teamai/projects/<slug>/`, resources in `<cwd>`). Use `user` for `~/` |
 | `--inherit-user-scope` | Project scope only: also sync safe user resources and search user knowledge |
 | `--no-inherit-user-scope` | Disable previously configured user-scope inheritance for this project |
 | `--role <id>` | Directly specify the primary role, skipping the interactive role prompt |
@@ -148,11 +166,11 @@ Example local config:
 
 ```yaml
 repo:
-  localPath: /path/to/my-project/.teamai/team-repo
+  localPath: ~/.teamai/projects/my-project-<hash>/team-repo
   remote: https://github.com/group/repo.git
 username: alice
 scope: project
-projectRoot: /path/to/my-project
+projectRoot: /path/to/my-project   # where resources land (this checkout)
 inheritUserScope: true            # optional; project scope only
 primaryRole: hai
 additionalRoles:
