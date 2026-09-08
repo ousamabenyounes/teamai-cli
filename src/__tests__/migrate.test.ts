@@ -118,12 +118,17 @@ describe('planMigration', () => {
     expect(await planMigration(repoRoot)).toBeNull();
   });
 
-  it('skips when a partition config already exists (partition is authoritative)', async () => {
+  it('plans a retire-only cleanup when a partition exists but legacy lingers', async () => {
+    // Interrupted prior run: partition built, source never retired. Instead of
+    // skipping (which would leave the legacy dir — incl. plaintext env — forever),
+    // planMigration must return a retire-only plan to finish the cleanup.
     await seedLegacyLayout();
     const partition = projectDataHome(repoRoot);
     await fse.ensureDir(partition);
     await fse.writeFile(path.join(partition, 'config.yaml'), 'repo: {}\n');
-    expect(await planMigration(repoRoot)).toBeNull();
+    const plan = await planMigration(repoRoot);
+    expect(plan).not.toBeNull();
+    expect(plan!.mode).toBe('retire-only');
   });
 
   it('skips a user-scope legacy config', async () => {
@@ -183,6 +188,34 @@ describe('runMigration', () => {
     expect(await fse.pathExists(path.join(`${legacyDir}.bak`, 'config.yaml'))).toBe(true);
   });
 
+  it('rebases repo.localPath from the legacy dir onto the partition', async () => {
+    await seedLegacyLayout();
+    const plan = await planMigration(repoRoot);
+    await runMigration(plan!);
+    // The migrated config must name the team-repo INSIDE the partition, not the
+    // now-retired legacy path — otherwise the next pull reads the wrong clone.
+    const partition = projectDataHome(repoRoot);
+    const migrated = YAML.parse(
+      await fse.readFile(path.join(partition, 'config.yaml'), 'utf-8'),
+    );
+    expect(migrated.repo.localPath).toBe(path.join(partition, 'team-repo'));
+    expect(migrated.repo.localPath).not.toContain('.teamai/team-repo');
+  });
+
+  it('leaves a localPath that is not inside the legacy dir untouched', async () => {
+    // e.g. an install whose team-repo clone lives elsewhere entirely.
+    const external = path.join(base, 'external-clone');
+    await writeLegacyConfig({
+      repo: { localPath: external, remote: 'git@example.com:t/r.git', kind: 'git' },
+    });
+    const plan = await planMigration(repoRoot);
+    await runMigration(plan!);
+    const migrated = YAML.parse(
+      await fse.readFile(path.join(projectDataHome(repoRoot), 'config.yaml'), 'utf-8'),
+    );
+    expect(migrated.repo.localPath).toBe(external);
+  });
+
   it('does not carry a live sync-lock into the backup', async () => {
     await seedLegacyLayout();
     const plan = await planMigration(repoRoot);
@@ -210,6 +243,63 @@ describe('runMigration', () => {
     await runMigration((await planMigration(repoRoot))!);
     // Legacy is now .bak; planMigration returns null (nothing to migrate).
     expect(await planMigration(repoRoot)).toBeNull();
+  });
+
+  it('retire-only mode retires a leftover legacy dir without re-copying (finishes an interrupted run)', async () => {
+    // Simulate a crash between the partition rename and the source retire: the
+    // partition is already built AND the legacy dir still lingers.
+    await seedLegacyLayout();
+    const partition = projectDataHome(repoRoot);
+    await fse.ensureDir(partition);
+    await fse.writeFile(path.join(partition, 'config.yaml'), 'repo:\n  kind: git\n');
+    await fse.writeFile(path.join(partition, 'sentinel'), 'authoritative\n');
+
+    const plan = await planMigration(repoRoot);
+    expect(plan!.mode).toBe('retire-only');
+    const result = await runMigration(plan!);
+    expect(result).toBe('migrated');
+    // Legacy retired → workspace zero-residue (the plaintext env no longer lingers).
+    expect(await fse.pathExists(legacyDir)).toBe(false);
+    expect(await fse.pathExists(`${legacyDir}.bak`)).toBe(true);
+    // The authoritative partition was NOT overwritten by a re-copy.
+    expect(await fse.pathExists(path.join(partition, 'sentinel'))).toBe(true);
+    // A follow-up plan is now null — the workspace is clean.
+    expect(await planMigration(repoRoot)).toBeNull();
+  });
+
+  it('aborts without touching the source when the staged clone is corrupt', async () => {
+    // A team-repo whose .git is present but not a real repo → verify's rev-parse
+    // smoke-check must fail, leaving the source intact and no partition/.bak.
+    await writeLegacyConfig();
+    await fse.writeJson(path.join(legacyDir, 'state.json'), {});
+    const tr = path.join(legacyDir, 'team-repo');
+    await fse.ensureDir(path.join(tr, '.git')); // a .git dir that is NOT a valid repo
+    await fse.writeFile(path.join(tr, 'README'), 'x\n');
+
+    const plan = await planMigration(repoRoot);
+    await expect(runMigration(plan!)).rejects.toThrow(/not a usable git repository/);
+    // Source untouched; nothing half-migrated.
+    expect(await fse.pathExists(path.join(legacyDir, 'config.yaml'))).toBe(true);
+    expect(await fse.pathExists(`${legacyDir}.bak`)).toBe(false);
+    expect(await fse.pathExists(projectDataHome(repoRoot))).toBe(false);
+    expect(await fse.pathExists(`${projectDataHome(repoRoot)}.staging`)).toBe(false);
+  });
+
+  it('migrates an http-mode install (no team-repo clone)', async () => {
+    await writeLegacyConfig({
+      repo: { localPath: legacyDir, remote: 'https://team.example/api', kind: 'http', url: 'https://team.example/api' },
+    });
+    await fse.writeFile(path.join(legacyDir, 'token'), 'api-key-xyz\n');
+    await fse.writeJson(path.join(legacyDir, 'state.json'), {});
+
+    const plan = await planMigration(repoRoot);
+    expect(plan!.mode).toBe('full');
+    const result = await runMigration(plan!);
+    expect(result).toBe('migrated');
+    const partition = projectDataHome(repoRoot);
+    expect(await fse.pathExists(path.join(partition, 'config.yaml'))).toBe(true);
+    expect(await fse.pathExists(path.join(partition, 'token'))).toBe(true);
+    expect(await fse.pathExists(legacyDir)).toBe(false);
   });
 
   it('recovers from a leftover staging dir (interrupted prior run)', async () => {

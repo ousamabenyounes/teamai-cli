@@ -131,14 +131,19 @@ partition on the next write command, so the workspace ends up with zero residue.
 
 **Gate** (`planMigration`, deliberately NOT `detectProjectConfig` — that
 short-circuits on an existing partition and runs the self-heal bootstrap as a side
-effect, both of which would mask the raw legacy state). Migrate iff:
+effect, both of which would mask the raw legacy state). Act iff:
 - in a git repo (the partition only exists for git repos), AND
 - `<workspaceRoot>/.teamai/config.yaml` exists, AND
-- `<partition>/config.yaml` does NOT (the partition, once built, is authoritative), AND
 - the legacy config is `scope: project` (user data never lives under `.teamai/`), AND
 - the legacy config is NOT `kind: self` — **self mode is a hard no-op**: its `.teamai/`
   is team knowledge committed to main, and `init --self` already retires any partition,
   so moving it would break "knowledge on main".
+
+The plan's **mode** then depends on the partition: a full copy when
+`<partition>/config.yaml` does not exist yet, or **retire-only** when it does (a prior
+run built the partition but was interrupted before retiring the source — see Interrupt
+recovery). retire-only never re-copies onto the authoritative partition; it only cleans
+up the leftover legacy dir.
 
 **Steps** (`runMigration`) — copy → verify → atomic rename, so an interruption never
 leaves data half-in-both-places:
@@ -162,8 +167,18 @@ leaves data half-in-both-places:
 
 Interrupt recovery: staging is a separate sibling dir, so a crash before step 3 leaves
 the partition absent and the source intact — a rerun discards `.staging/` and starts
-clean. A crash between steps 3 and 5 leaves the partition built (so the next run stands
-down) with the legacy dir still present (double-read still works).
+clean. A crash between steps 3 and 5 leaves the partition built with the legacy dir
+still present; the next write command's `planMigration` sees "partition exists AND
+legacy lingers" and returns a **retire-only** plan that finishes the job — it retires
+the leftover legacy dir to `.teamai.bak/` WITHOUT re-copying onto the now-authoritative
+partition. This closes the gap where the legacy dir (including its plaintext `env`)
+would otherwise linger in the workspace forever, breaking the zero-residue guarantee.
+
+The staged team-repo clone is smoke-checked (`git rev-parse HEAD`) before the rename,
+so a partial/corrupt copy aborts with the source untouched rather than promoting a
+broken clone. If a write command's migration fails, teamai prints a clean error and
+exits non-zero (the source is intact, so a rerun retries safely) instead of surfacing
+a raw async-hook rejection.
 
 **Downgrade is not supported** — an older teamai treats a partitioned install as
 uninitialized; `.teamai.bak/` is the manual rollback. Flag prominently in release notes.

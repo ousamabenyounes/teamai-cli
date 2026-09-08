@@ -34,7 +34,17 @@ program
     if (TEAMAI_HOOK_SUBCOMMANDS.includes(name as (typeof TEAMAI_HOOK_SUBCOMMANDS)[number])) return;
     if (!MIGRATION_TRIGGER_COMMANDS.has(name)) return;
     const { maybeMigrate } = await import('./migrate.js');
-    await maybeMigrate({ dryRun: !!opts.dryRun });
+    try {
+      await maybeMigrate({ dryRun: !!opts.dryRun });
+    } catch (e) {
+      // A failed migration must not proceed into the command on stale/partial
+      // state. Surface a clean message and exit — the copy→verify→rename design
+      // leaves the source intact, so a rerun retries safely. (Without this the
+      // async-hook rejection would surface as a raw unhandled-rejection stack.)
+      log.error(`Auto-migration failed: ${(e as Error).message}`);
+      log.error('Your original .teamai data is unchanged. Re-run the command to retry.');
+      process.exit(1);
+    }
   });
 
 program

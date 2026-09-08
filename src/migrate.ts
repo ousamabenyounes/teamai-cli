@@ -4,7 +4,8 @@ import YAML from 'yaml';
 import { LocalConfigSchema, SYNC_LOCK_FILENAME } from './types.js';
 import { resolveAnchors } from './utils/git.js';
 import { projectDataHome } from './utils/partition.js';
-import { pathExists, readFileSafe, remove, writeFile } from './utils/fs.js';
+import { realpath } from 'node:fs/promises';
+import { expandHome, pathExists, readFileSafe, remove, writeFile } from './utils/fs.js';
 import { acquireLock, releaseLock } from './update.js';
 import { log } from './utils/logger.js';
 
@@ -45,6 +46,15 @@ export interface MigrationPlan {
   legacyDir: string;
   partitionDir: string;
   anchor: string;
+  /**
+   * 'full': copy legacy → partition, then retire the source.
+   * 'retire-only': the partition is already built (e.g. a prior run crashed
+   * between the partition rename and the source retire), so just clean up the
+   * leftover legacy dir. Without this, planMigration would return null on the
+   * "partition exists" check and the legacy dir — including its plaintext `env`
+   * — would linger in the workspace forever, breaking the zero-residue promise.
+   */
+  mode: 'full' | 'retire-only';
 }
 
 /**
@@ -57,10 +67,11 @@ export interface MigrationPlan {
  *  - not a git repo (the partition only exists for git repos; a non-git
  *    `.teamai/` is already at its final location),
  *  - no legacy config.yaml (nothing to migrate),
- *  - a partition config already exists (the partition is authoritative once
- *    built; detection never looks back at legacy),
  *  - the legacy config is user scope (user data never lives under `.teamai/`),
  *  - the legacy config is self mode (its `.teamai/` is committed team knowledge).
+ *
+ * When a partition config already exists AND a legacy dir still lingers, returns
+ * a 'retire-only' plan to finish an interrupted migration instead of skipping.
  */
 export async function planMigration(cwd?: string): Promise<MigrationPlan | null> {
   const anchors = await resolveAnchors(cwd ?? process.cwd());
@@ -69,10 +80,6 @@ export async function planMigration(cwd?: string): Promise<MigrationPlan | null>
   const legacyDir = path.join(anchors.workspaceRoot, '.teamai');
   const legacyConfig = path.join(legacyDir, 'config.yaml');
   if (!(await pathExists(legacyConfig))) return null;
-
-  const partitionDir = projectDataHome(anchors.projectAnchor);
-  // The partition, once built, is authoritative — never migrate on top of it.
-  if (await pathExists(path.join(partitionDir, 'config.yaml'))) return null;
 
   // Read the legacy config directly to gate on scope/kind. A malformed config is
   // treated as "nothing to migrate" rather than crashing a write command.
@@ -90,7 +97,15 @@ export async function planMigration(cwd?: string): Promise<MigrationPlan | null>
   if (scope !== 'project') return null;
   if (kind === 'self') return null;
 
-  return { legacyDir, partitionDir, anchor: anchors.projectAnchor };
+  const partitionDir = projectDataHome(anchors.projectAnchor);
+  // If the partition is already built, the copy is done (or was done by a prior
+  // run that crashed before retiring the source). Don't re-copy onto the
+  // authoritative partition — just finish the job by retiring the leftover
+  // legacy dir, so the workspace really does end up residue-free.
+  const mode: MigrationPlan['mode'] =
+    (await pathExists(path.join(partitionDir, 'config.yaml'))) ? 'retire-only' : 'full';
+
+  return { legacyDir, partitionDir, anchor: anchors.projectAnchor, mode };
 }
 
 /**
@@ -114,14 +129,21 @@ export async function runMigration(
   plan: MigrationPlan,
   opts: { dryRun?: boolean } = {},
 ): Promise<'migrated' | 'skipped' | 'dry-run'> {
-  const { legacyDir, partitionDir, anchor } = plan;
+  const { legacyDir, partitionDir, anchor, mode } = plan;
 
   if (opts.dryRun) {
-    const entries = await listMigratableEntries(legacyDir);
-    log.info(
-      `[dry-run] would migrate ${entries.length} item(s) from ${legacyDir} ` +
-        `to ${partitionDir}, then rename the old directory to ${legacyDir}.bak`,
-    );
+    if (mode === 'retire-only') {
+      log.info(
+        `[dry-run] partition already built at ${partitionDir}; would retire the ` +
+          `leftover ${legacyDir} to ${legacyDir}.bak`,
+      );
+    } else {
+      const entries = await listMigratableEntries(legacyDir);
+      log.info(
+        `[dry-run] would migrate ${entries.length} item(s) from ${legacyDir} ` +
+          `to ${partitionDir}, then rename the old directory to ${legacyDir}.bak`,
+      );
+    }
     return 'dry-run';
   }
 
@@ -134,11 +156,26 @@ export async function runMigration(
   const staging = `${partitionDir}.staging`;
   let lockReleased = false;
   try {
+    // 'retire-only': a prior run already built the partition but crashed before
+    // retiring the source. The partition is authoritative — do NOT re-copy onto
+    // it — just finish by retiring the leftover legacy dir.
+    if (mode === 'retire-only') {
+      await releaseLock(lockPath);
+      lockReleased = true;
+      const backup = await retireLegacy(legacyDir);
+      log.success(`Finished an interrupted migration: retired ${legacyDir} to ${backup}`);
+      return 'migrated';
+    }
+
     // Re-check under the lock: a sibling worktree may have migrated while we
-    // waited (TOCTOU). If the partition config now exists, stand down.
+    // waited (TOCTOU). If the partition config now exists, retire our leftover
+    // legacy dir rather than copying onto the authoritative partition.
     if (await pathExists(path.join(partitionDir, 'config.yaml'))) {
-      log.debug('migration skipped: partition built by a concurrent process');
-      return 'skipped';
+      await releaseLock(lockPath);
+      lockReleased = true;
+      const backup = await retireLegacy(legacyDir);
+      log.debug(`partition built by a concurrent process; retired ${legacyDir} to ${backup}`);
+      return 'migrated';
     }
 
     // 1. Copy into a sibling staging dir (NOT the partition itself) so an
@@ -160,6 +197,13 @@ export async function runMigration(
     // 2. Verify the staged copy before making it authoritative.
     await verifyStaging(legacyDir, staging);
 
+    // 2b. Rebase absolute paths persisted in config.yaml that pointed INTO the
+    //     legacy dir (chiefly repo.localPath → <legacyDir>/team-repo) onto the
+    //     partition. Without this, the migrated config would still name the old
+    //     team-repo location, so the next pull would read/clone the wrong path.
+    //     Done in staging (pre-rename) so it stays inside the atomic window.
+    await rebaseConfigPaths(path.join(staging, 'config.yaml'), legacyDir, partitionDir);
+
     // 3. Atomic switch: same-filesystem rename of the staged dir onto the final
     //    partition path. partitionDir does not exist yet (planMigration + the
     //    under-lock re-check both gate on its config.yaml, and nothing else
@@ -177,13 +221,7 @@ export async function runMigration(
     await releaseLock(lockPath);
     lockReleased = true;
 
-    // Retire the source to `.teamai.bak/` (same-fs sibling → atomic rename).
-    // Never auto-delete: it is the manual rollback path (downgrading to an
-    // older teamai is not supported — see release notes / design doc R6).
-    const backup = `${legacyDir}.bak`;
-    await remove(backup);
-    await fse.rename(legacyDir, backup);
-
+    const backup = await retireLegacy(legacyDir);
     log.success(`Migrated teamai data to ${partitionDir}`);
     log.info(
       `Old data preserved at ${backup} — remove it once you've confirmed ` +
@@ -211,6 +249,72 @@ export async function maybeMigrate(opts: { dryRun?: boolean } = {}): Promise<voi
   await runMigration(plan, opts);
 }
 
+/**
+ * Rewrite absolute paths in the staged config.yaml that pointed into the legacy
+ * dir so they name the partition instead. Only `repo.localPath` is persisted as
+ * an absolute path today (the team-repo clone at `<legacyDir>/team-repo`); a path
+ * NOT inside legacyDir (e.g. an http install whose localPath sits elsewhere) is
+ * left untouched. Preserves every other field verbatim via YAML round-trip.
+ */
+async function rebaseConfigPaths(
+  stagedConfig: string,
+  legacyDir: string,
+  partitionDir: string,
+): Promise<void> {
+  const content = await readFileSafe(stagedConfig);
+  if (!content) return;
+  let doc: Record<string, unknown>;
+  try {
+    doc = YAML.parse(content);
+  } catch {
+    return; // verifyStaging already validated parseability; be defensive anyway
+  }
+  const repo = doc?.repo as { localPath?: string } | undefined;
+  const rebased = await rebasePath(repo?.localPath, legacyDir, partitionDir);
+  if (repo && rebased !== undefined && rebased !== repo.localPath) {
+    repo.localPath = rebased;
+    await writeFile(stagedConfig, YAML.stringify(doc));
+  }
+}
+
+/**
+ * If `p` is inside `fromDir`, return the equivalent path inside `toDir`;
+ * otherwise return `p` unchanged (undefined stays undefined).
+ *
+ * `fromDir` is realpath-normalized (it comes from resolveAnchors), but the
+ * persisted `p` may use a symlinked spelling (e.g. macOS `/tmp` → `/private/tmp`)
+ * or a `~` prefix, so a raw string compare would miss the match. We expand `~`
+ * and realpath `p` first — the old location still exists at this point in the
+ * migration (the source is renamed to `.bak` only afterwards) — so both sides are
+ * canonical before path.relative decides containment. A `..` result means `p`
+ * escapes fromDir and is left alone (e.g. an external clone).
+ */
+async function rebasePath(
+  p: string | undefined,
+  fromDir: string,
+  toDir: string,
+): Promise<string | undefined> {
+  if (!p) return p;
+  const expanded = expandHome(p);
+  const canonical = await realpath(expanded).catch(() => expanded);
+  const rel = path.relative(fromDir, canonical);
+  if (rel === '') return toDir;
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return p;
+  return path.join(toDir, rel);
+}
+
+/**
+ * Retire the source dir to a `.bak` sibling (same-fs → atomic rename). Never
+ * auto-deleted: it is the manual rollback path (downgrading to an older teamai
+ * is not supported — see release notes / design doc R6). Returns the backup path.
+ */
+async function retireLegacy(legacyDir: string): Promise<string> {
+  const backup = `${legacyDir}.bak`;
+  await remove(backup);
+  await fse.rename(legacyDir, backup);
+  return backup;
+}
+
 /** Top-level entries under a legacy `.teamai/` that migration will copy. */
 async function listMigratableEntries(legacyDir: string): Promise<string[]> {
   const names = await fse.readdir(legacyDir);
@@ -221,9 +325,12 @@ async function listMigratableEntries(legacyDir: string): Promise<string[]> {
  * Verify a staged copy is complete enough to become authoritative:
  *  - config.yaml parses as a LocalConfig,
  *  - if the source has a team-repo git clone, the staged copy has its `.git`
- *    too (proves the copy did NOT drop `.git` — the copyDir-vs-fse.copy trap),
+ *    AND `git rev-parse HEAD` works on it (proves the copy did NOT drop `.git`
+ *    — the copyDir-vs-fse.copy trap — and the clone is actually usable, not just
+ *    present-but-corrupt),
  *  - every migratable top-level entry made it across.
- * Throws on any shortfall so the caller aborts without touching the source.
+ * Runs on the STAGING copy, before the atomic rename, so any shortfall aborts
+ * with the source untouched and the partial staging discarded.
  */
 async function verifyStaging(legacyDir: string, staging: string): Promise<void> {
   const stagedConfig = path.join(staging, 'config.yaml');
@@ -237,9 +344,22 @@ async function verifyStaging(legacyDir: string, staging: string): Promise<void> 
 
   const legacyGit = path.join(legacyDir, 'team-repo', '.git');
   if (await pathExists(legacyGit)) {
-    const stagedGit = path.join(staging, 'team-repo', '.git');
-    if (!(await pathExists(stagedGit))) {
+    const stagedRepo = path.join(staging, 'team-repo');
+    if (!(await pathExists(path.join(stagedRepo, '.git')))) {
       throw new Error('migration verify: team-repo/.git missing after copy (clone would be broken)');
+    }
+    // Smoke-check the clone: a working rev-parse proves the .git is intact, not
+    // just present. Catches a partial/corrupt copy that a mere existence check
+    // would wave through.
+    try {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      await promisify(execFile)('git', ['rev-parse', 'HEAD'], { cwd: stagedRepo });
+    } catch (e) {
+      throw new Error(
+        `migration verify: the staged team-repo clone is not a usable git ` +
+          `repository (${(e as Error).message})`,
+      );
     }
   }
 
