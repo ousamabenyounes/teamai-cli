@@ -94,6 +94,23 @@ function mockHome(home: string): () => void {
     };
 }
 
+/** The `Built-in hooks (A)` section of the listing, up to the team-hooks one. */
+function builtinSection(text: string): string {
+    const start = text.indexOf('Built-in hooks (A)');
+    const end = text.indexOf('Team hooks (B)');
+    return text.slice(start, end === -1 ? undefined : end);
+}
+
+/** The built-in lines printed under the group that contains `tool`. */
+function toolBlock(section: string, tool: string): string[] {
+    const lines = section.split('\n');
+    const header = lines.findIndex((line) => /^ {2}\S/.test(line) && line.trim().replace(/:$/, '').split(', ').includes(tool));
+    if (header === -1) return [];
+    const rest = lines.slice(header + 1);
+    const next = rest.findIndex((line) => /^ {2}\S/.test(line));
+    return next === -1 ? rest : rest.slice(0, next);
+}
+
 beforeEach(() => {
     vi.clearAllMocks();
     mockedAutoDetectInit.mockResolvedValue({ localConfig: mockLocalConfig, teamConfig: mockTeamConfig });
@@ -433,6 +450,106 @@ describe('hooksList', () => {
         const shared = path.join(projectRoot, '.qoder', 'settings.json');
         expect(mockedGetHookStatus).toHaveBeenCalledWith(shared, 'qoder-cn');
         expect(mockedGetHookStatus).not.toHaveBeenCalledWith(shared, 'qoder');
+    });
+
+    // #717: the built-in block was rendered from a hardcoded
+    // `builtinHookDefs('claude')`, so it showed Claude's set for every tool.
+    // Copilot's extra SessionEnd entry — which `hooks inject` really writes —
+    // never appeared.
+    it('lists the SessionEnd hook Copilot really receives (#717)', async () => {
+        const originalCopilotHome = process.env.COPILOT_HOME;
+        process.env.COPILOT_HOME = COPILOT_HOME_FIXTURE;
+        const out: string[] = [];
+        const consoleLog = vi.spyOn(console, 'log').mockImplementation((m?: unknown) => { out.push(String(m)); });
+        mockedAutoDetectInit.mockResolvedValue({
+            localConfig: { ...mockLocalConfig, enabledAgents: ['copilot'] },
+            teamConfig: copilotConfig(),
+        });
+
+        try {
+            await hooksList({});
+        } finally {
+            if (originalCopilotHome === undefined) delete process.env.COPILOT_HOME;
+            else process.env.COPILOT_HOME = originalCopilotHome;
+            consoleLog.mockRestore();
+        }
+
+        expect(builtinSection(out.join('\n'))).toContain('SessionEnd');
+    });
+
+    // The converse of the same defect: Claude has no SessionEnd entry, so a
+    // Claude-only listing must not grow one.
+    it('does not show SessionEnd for a tool that never receives it', async () => {
+        const restoreHome = mockHome('/home/testuser');
+        const out: string[] = [];
+        const consoleLog = vi.spyOn(console, 'log').mockImplementation((m?: unknown) => { out.push(String(m)); });
+        mockedAutoDetectInit.mockResolvedValue({
+            localConfig: { ...mockLocalConfig, enabledAgents: ['claude'] },
+            teamConfig: mockTeamConfig,
+        });
+
+        try {
+            await hooksList({});
+        } finally {
+            restoreHome();
+            consoleLog.mockRestore();
+        }
+
+        expect(builtinSection(out.join('\n'))).not.toContain('SessionEnd');
+    });
+
+    // #717: the dispatch command shape is per tool too. ZCode's entries are
+    // `process`-typed, so its command carries no `bash -lc` wrapper — printing
+    // Claude's wrapped form for it told the user to run something ZCode never
+    // has on disk.
+    it('renders each tool its own dispatch command shape (#717)', async () => {
+        const restoreHome = mockHome('/home/testuser');
+        const out: string[] = [];
+        const consoleLog = vi.spyOn(console, 'log').mockImplementation((m?: unknown) => { out.push(String(m)); });
+        mockedAutoDetectInit.mockResolvedValue({
+            localConfig: { ...mockLocalConfig, enabledAgents: ['claude', 'zcode'] },
+            teamConfig: {
+                toolPaths: {
+                    claude: { settings: '.claude/settings.json' },
+                    zcode: { settings: '.zcode/cli/config.json' },
+                },
+            },
+        });
+
+        try {
+            await hooksList({});
+        } finally {
+            restoreHome();
+            consoleLog.mockRestore();
+        }
+
+        const section = builtinSection(out.join('\n'));
+        const zcodeLines = toolBlock(section, 'zcode');
+        expect(zcodeLines.join('\n')).toContain('teamai hook-dispatch session-start');
+        expect(zcodeLines.join('\n')).not.toContain('bash -lc');
+        expect(toolBlock(section, 'claude').join('\n')).toContain('bash -lc');
+    });
+
+    // A tool with no settings file is never reconciled through this path, so
+    // the built-in block must stay silent about it rather than advertise hooks
+    // it does not receive.
+    it('omits tools with no hook surface from the built-in block', async () => {
+        const restoreHome = mockHome('/home/testuser');
+        const out: string[] = [];
+        const consoleLog = vi.spyOn(console, 'log').mockImplementation((m?: unknown) => { out.push(String(m)); });
+
+        try {
+            await hooksList({});
+        } finally {
+            restoreHome();
+            consoleLog.mockRestore();
+        }
+
+        const text = out.join('\n');
+        // `codex` still shows up in the status table…
+        expect(text).toContain('not configured');
+        // …but never in the built-in listing.
+        expect(builtinSection(text)).not.toContain('codex');
     });
 
     it('lists standalone Copilot hooks under COPILOT_HOME', async () => {

@@ -4,7 +4,7 @@ import { reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig, 
 import { builtinHookDefs } from './builtin-hooks.js';
 import { parseTeamHooks } from './resources/hooks.js';
 import { log } from './utils/logger.js';
-import type { GlobalOptions } from './types.js';
+import type { GlobalOptions, HookDef } from './types.js';
 import {
     COPILOT_TOOL_ID,
     getManagedHooksPath,
@@ -22,6 +22,13 @@ interface HookListRow {
     tool: string;
     status: HookListStatus;
     settingsPath: string;
+    /**
+     * Built-in hooks this tool really receives. Empty for a tool the settings
+     * reconcile path never writes to — its surface is owned by a standalone
+     * adapter, so listing the settings set for it would advertise hooks that
+     * are not there (#717).
+     */
+    builtinDefs: HookDef[];
 }
 
 function formatDisplayPath(settingsPath: string): string {
@@ -131,17 +138,26 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
                 tool,
                 status: await pathExists(extFile) ? 'installed' : 'missing',
                 settingsPath: formatDisplayPath(extFile),
+                builtinDefs: [],
             });
             continue;
         }
         if (!hookPath) {
-            rows.push({ tool, status: 'not configured', settingsPath: 'no settings configured' });
+            rows.push({
+                tool,
+                status: 'not configured',
+                settingsPath: 'no settings configured',
+                builtinDefs: [],
+            });
             continue;
         }
         rows.push({
             tool,
             status: await getHookStatus(hookPath, tool),
             settingsPath: formatDisplayPath(hookPath),
+            // Settings-driven: reconcileHooks writes exactly this set into the
+            // file probed above.
+            builtinDefs: builtinHookDefs(tool),
         });
     }
 
@@ -150,10 +166,31 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
     const teamDefs = await parseTeamHooks(localConfig.repo.localPath);
 
     console.log('');
-    console.log('Built-in hooks (A) — teamai operational (injected into every tool):');
-    for (const d of builtinHookDefs('claude')) {
-        const matcher = d.matcher && d.matcher !== '*' ? ` [${d.matcher}]` : '';
-        console.log(`  ${d.event}${matcher}  →  ${d.command}`);
+    console.log('Built-in hooks (A) — teamai operational, per tool:');
+    // The built-in set is per tool, not universal: Copilot carries an extra
+    // SessionEnd entry, and the dispatch command shape differs for ZCode (raw,
+    // no shell wrapper) and for the GUI tools that need the PATH wrapper.
+    // Rendering one hardcoded tool's set both hid hooks `hooks inject` really
+    // installs and showed commands no tool has on disk (#717). Tools whose set
+    // is identical once the tool id is folded out share one block, so the
+    // listing stays short instead of repeating the same rows per tool.
+    const builtinGroups = new Map<string, { tools: string[]; lines: string[] }>();
+    for (const { tool, builtinDefs } of rows) {
+        if (builtinDefs.length === 0) continue;
+        const lines = builtinDefs.map((d) => {
+            const matcher = d.matcher && d.matcher !== '*' ? ` [${d.matcher}]` : '';
+            const command = d.command.split(`--tool ${tool}`).join('--tool <tool>');
+            return `    ${d.event}${matcher}  →  ${command}`;
+        });
+        const key = lines.join('\n');
+        const group = builtinGroups.get(key);
+        if (group) group.tools.push(tool);
+        else builtinGroups.set(key, { tools: [tool], lines });
+    }
+    if (builtinGroups.size === 0) console.log('  (none)');
+    for (const group of builtinGroups.values()) {
+        console.log(`  ${group.tools.join(', ')}:`);
+        for (const line of group.lines) console.log(line);
     }
 
     console.log('');
