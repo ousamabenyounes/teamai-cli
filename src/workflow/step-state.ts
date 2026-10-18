@@ -130,7 +130,8 @@ function become<T extends StepState>(state: StepState, next: Omit<T, keyof StepB
   const fields = state as Record<string, unknown>;
   const kept = Object.fromEntries(BASE_KEYS.filter((key) => fields[key] !== undefined).map((key) => [key, fields[key]]));
   for (const key of Object.keys(fields)) delete fields[key];
-  return Object.assign(fields, kept, next) as T;
+  const normalized = StepStateSchema.parse({ ...kept, ...next });
+  return Object.assign(fields, normalized) as T;
 }
 
 export function skip(state: StepState, settledAt: number): SkippedStep {

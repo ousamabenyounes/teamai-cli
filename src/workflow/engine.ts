@@ -17,25 +17,32 @@ import { parseStepPath } from './step-path.js';
 import { cancel, fail, lease, release, settled, skip, start, stopped, succeed, type ItemResult, type LeasedStep, type StepState } from './step-state.js';
 import { addItems, afterStanding, expandItems, isItem, itemsAfter, itemsOf, itemsSettled, startedItems } from './fan-out.js';
 import { decideRound, decideStepLoop, exhaustedAtStart, firstPass, loopSettled } from './loop.js';
-import { childScope, contextOf, insertChildren, localId, statesIn, topScope, type Scope } from './scope.js';
-import { generateRunId, isRunId, readRun, runLockPath, writeRun } from './store.js';
-import type {
-  CachedWorkflow,
-  DriverIdentity,
-  OutputSchema,
-  RunState,
-  RunStatus,
-  StepOutcome,
-  TokenUsage,
-  WorkflowDefinition,
-  WorkflowEnvelope,
-  WorkflowFailure,
-  WorkflowStep,
+import { childScope, contextOf, indexedPosition, indexedState, indexReconcile, insertChildren, invalidateReconcile, localId, statesIn, topScope, type Scope } from './scope.js';
+import { generateRunId, isRunId, readRun, runLockPath, writeEngineRun, writeRun } from './store.js';
+import {
+  hasAction,
+  RUN_RECONCILE_VERSION,
+  type CachedWorkflow,
+  type DriverIdentity,
+  type FanOutReconcileProgress,
+  type OutputSchema,
+  type RunState,
+  type RunStatus,
+  type StepOutcome,
+  type TokenUsage,
+  type WorkflowDefinition,
+  type WorkflowEnvelope,
+  type WorkflowFailure,
+  type WorkflowStep,
 } from './types.js';
-import { hasAction } from './types.js';
 
 const LOCK_ATTEMPTS = 40;
 const LOCK_WAIT_MS = 25;
+const ITEM_PATH = /^(\[\d+\])(?:\.|$)/;
+const ITEM_INDEX = /\[\d+\]/g;
+const HEAP_BRANCHES = 2;
+const FIRST_CHILD_OFFSET = 1;
+const INVALID_QUEUE_POSITION = Number.MAX_SAFE_INTEGER;
 
 /**
  * Recent settled attempt ids kept for `repeated_report`.
@@ -106,7 +113,7 @@ async function withRun<T extends WorkflowEnvelope>(
     const result = await mutate(loaded, now);
     if (result.save) {
       loaded.updatedAt = now;
-      await writeRun(config, loaded);
+      await writeEngineRun(config, loaded);
     }
     return result.envelope;
   } finally {
@@ -134,7 +141,7 @@ function locateStep(run: RunState, path: string): { scope: Scope; step: Workflow
     if (!step) return undefined;
     if (index === segments.length - 1) return { scope, step };
     const instance = `${scope.prefix}${segment.id}${segment.index === undefined ? '' : `[${segment.index}]`}`;
-    const state = run.steps.find((item) => item.id === instance);
+    const state = indexedState(run, instance) ?? run.steps.find((item) => item.id === instance);
     const child = state && childScope(run, scope, statesIn(run, scope), state, step);
     if (!child) return undefined;
     scope = child;
@@ -463,6 +470,136 @@ function settleRunning(run: RunState, scope: Scope, states: StepState[], state: 
   return 'unreadable' in child ? child : settleScope(run, child);
 }
 
+/** Saves the independent uncapped fan-out work that a full scan found. */
+function saveFanOutProgress(run: RunState, owner: StepState, items: StepState[], queued: ReadonlySet<string>): void {
+  const fanOuts = run.reconcile?.fanOuts ?? Object.create(null) as Record<string, FanOutReconcileProgress>;
+  const queue = items.filter((item) => queued.has(item.id)).map((item) => item.id);
+  const progress: FanOutReconcileProgress = {
+    queue,
+    queued: Object.fromEntries(queue.map((item) => [item, true])),
+    remaining: items.filter((item) => !settled(item)).length,
+  };
+  Object.defineProperty(fanOuts, owner.id, { value: progress, enumerable: true, configurable: true, writable: true });
+  run.reconcile = { version: RUN_RECONCILE_VERSION, fanOuts };
+  indexReconcile(run);
+}
+
+function fanOutProgress(run: RunState, ownerId: string): FanOutReconcileProgress | undefined {
+  const fanOuts = run.reconcile?.fanOuts;
+  return fanOuts && Object.hasOwn(fanOuts, ownerId) ? fanOuts[ownerId] : undefined;
+}
+
+function queuedBefore(run: RunState, left: string, right: string): boolean {
+  return (indexedPosition(run, left) ?? INVALID_QUEUE_POSITION) < (indexedPosition(run, right) ?? INVALID_QUEUE_POSITION);
+}
+
+function enqueueItem(run: RunState, progress: FanOutReconcileProgress, itemId: string): void {
+  if (progress.queued[itemId]) return;
+  progress.queued[itemId] = true;
+  progress.queue.push(itemId);
+  let position = progress.queue.length - 1;
+  while (position > 0) {
+    const parent = Math.floor((position - FIRST_CHILD_OFFSET) / HEAP_BRANCHES);
+    if (!queuedBefore(run, progress.queue[position]!, progress.queue[parent]!)) break;
+    [progress.queue[parent], progress.queue[position]] = [progress.queue[position]!, progress.queue[parent]!];
+    position = parent;
+  }
+}
+
+function dequeueItem(run: RunState, progress: FanOutReconcileProgress): string | undefined {
+  const first = progress.queue[0];
+  if (first === undefined) return undefined;
+  delete progress.queued[first];
+  const last = progress.queue.pop();
+  if (progress.queue.length === 0 || last === undefined) return first;
+  progress.queue[0] = last;
+  let position = 0;
+  for (;;) {
+    const left = position * HEAP_BRANCHES + FIRST_CHILD_OFFSET;
+    if (left >= progress.queue.length) return first;
+    const right = left + FIRST_CHILD_OFFSET;
+    const child = right < progress.queue.length && queuedBefore(run, progress.queue[right]!, progress.queue[left]!) ? right : left;
+    if (!queuedBefore(run, progress.queue[child]!, progress.queue[position]!)) return first;
+    [progress.queue[position], progress.queue[child]] = [progress.queue[child]!, progress.queue[position]!];
+    position = child;
+  }
+}
+
+/** An item's id under `owner`, when `path` is that item or anything inside its workflow. */
+function itemUnder(owner: string, path: string): string | undefined {
+  if (!path.startsWith(owner)) return undefined;
+  const match = ITEM_PATH.exec(path.slice(owner.length));
+  return match ? `${owner}${match[1]}` : undefined;
+}
+
+/** Fan-out owners and item runners enclosing `path`, from outermost to innermost. */
+function enclosingItems(path: string): Array<{ owner: string; itemId: string }> {
+  return [...path.matchAll(ITEM_INDEX)].map((match) => ({
+    owner: path.slice(0, match.index),
+    itemId: path.slice(0, match.index + match[0].length),
+  }));
+}
+
+/** Adds a reported item's scope back to every persisted fan-out queue that encloses it. */
+function markReportedItem(run: RunState, path: string): void {
+  if (!run.reconcile) return;
+  for (const { owner, itemId } of enclosingItems(path)) {
+    const progress = fanOutProgress(run, owner);
+    if (!progress) continue;
+    const item = indexedState(run, itemId)!;
+    if (settled(item)) {
+      progress.remaining = Math.max(0, progress.remaining - 1);
+      continue;
+    }
+    enqueueItem(run, progress, itemId);
+  }
+}
+
+/**
+ * Resumes one of the item scopes a previous process left ready or a report made dirty.
+ * `null` means the persisted index was invalidated and the caller must reconcile in full.
+ */
+function settleQueuedItem(
+  run: RunState, scope: Scope, states: StepState[], owner: StepState, definition: WorkflowStep,
+): Settled | null {
+  const progress = fanOutProgress(run, owner.id);
+  if (!progress) return null;
+  for (;;) {
+    const itemId = progress.queue[0];
+    if (!itemId) {
+      if (progress.remaining !== 0) return { inProgress: true };
+      delete run.reconcile!.fanOuts[owner.id];
+      return itemsSettled(itemsOf(run, owner), run.revision);
+    }
+    const item = indexedState(run, itemId);
+    if (!item || itemUnder(owner.id, item.id) !== item.id) {
+      invalidateReconcile(run);
+      return null;
+    }
+    if (settled(item)) {
+      dequeueItem(run, progress);
+      progress.remaining = Math.max(0, progress.remaining - 1);
+      continue;
+    }
+    if (item.status === 'leased') {
+      dequeueItem(run, progress);
+      continue;
+    }
+    const advanced = advanceInstance(run, scope, states, item, definition);
+    if (!run.reconcile) return null;
+    if (advanced && 'unreadable' in advanced) return advanced;
+    if (advanced && 'lease' in advanced) return advanced;
+    if (advanced && 'inProgress' in advanced) {
+      dequeueItem(run, progress);
+      continue;
+    }
+    if (settled(item)) {
+      dequeueItem(run, progress);
+      progress.remaining = Math.max(0, progress.remaining - 1);
+    }
+  }
+}
+
 /**
  * Advances one ready instance. A running one settles what it runs. A pending leaf is returned to lease, a pending
  * workflow step starts its workflow, and a pending `for_each` step adds an instance per item of `items`. What the
@@ -507,10 +644,14 @@ function advanceInstance(
 function settleItems(
   run: RunState, scope: Scope, states: StepState[], state: StepState, definition: WorkflowStep,
 ): Settled {
+  const queued = settleQueuedItem(run, scope, states, state, definition);
+  if (queued) return queued;
+  const candidates = new Set<string>();
   for (;;) {
     const items = itemsOf(run, state);
     const after = itemsAfter(state.id, items.map((item) => item.item));
     if (!Array.isArray(after)) return { unreadable: `Run ${run.id} ${after.message}` };
+    const persistsProgress = definition.forEach?.maxParallel === undefined && after.every((dependencies) => dependencies.length === 0);
     const dependencies = (index: number): StepState[] => after[index]?.map((other) => items[other]!) ?? [];
     const standing = (index: number): ReturnType<typeof afterStanding> => afterStanding(dependencies(index));
     const dependents: number[][] = items.map(() => []);
@@ -534,7 +675,10 @@ function settleItems(
       if (item.status !== 'running' && (item.status !== 'pending' || standing(index) !== 'ready' || (maxParallel !== undefined && started >= maxParallel))) continue;
       const advanced = advanceInstance(run, scope, states, item, definition);
       if (advanced && 'unreadable' in advanced) return advanced;
-      if (advanced && 'lease' in advanced) candidate ??= advanced;
+      if (advanced && 'lease' in advanced) {
+        candidate ??= advanced;
+        if (persistsProgress) candidates.add(item.id);
+      }
       if (advanced) continue;
       changed = true;
       // Starting an item changes no other item's standing, so the scan goes on. Settling one can make an earlier item
@@ -544,6 +688,7 @@ function settleItems(
     }
     if (changed) continue;
     if (items.every(settled)) return itemsSettled(items, run.revision);
+    if (persistsProgress) saveFanOutProgress(run, state, items, candidates);
     return candidate ?? { inProgress: true };
   }
 }
@@ -992,6 +1137,7 @@ export async function reportAttempt(config: LocalConfig, runId: string, report: 
     const settledStep = outcome === 'released' ? release(step)
       : outcome === 'success' ? succeed(step, { ...settlement, ...(report.outputs !== undefined ? { outputs: report.outputs } : {}) })
         : fail(step, { ...settlement, failure });
+    markReportedItem(run, settledStep.id);
     return {
       save: true,
       envelope: ok({

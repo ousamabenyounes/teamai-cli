@@ -168,6 +168,25 @@ export interface WorkflowFailure {
   message: string;
 }
 
+/** Durable work left by a fully reconciled uncapped fan-out. */
+export interface FanOutReconcileProgress {
+  /** Min-heap of item runners whose scope may now yield the next lease. */
+  queue: string[];
+  /** Membership index for `queue`, so a report never scans it for duplicates. */
+  queued: Record<string, true>;
+  /** Item runners that have not settled yet. */
+  remaining: number;
+}
+
+export const RUN_RECONCILE_VERSION = 1;
+export const RUN_RECONCILE_CHECKSUM_VERSION = 1;
+
+/** Indexes and reconcile queues that let the next CLI process resume without scanning settled scopes. */
+export interface RunReconcileProgress {
+  version: typeof RUN_RECONCILE_VERSION;
+  fanOuts: Record<string, FanOutReconcileProgress>;
+}
+
 /** Durable run file. `revision` rejects stale reports; `definition` is the cached snapshot. */
 export interface RunState {
   schemaVersion: 'v1alpha1';
@@ -202,6 +221,12 @@ export interface RunState {
   archive?: ArchivedPass[];
   /** The round of a looping top-level workflow. */
   round?: number;
+  /** Engine-owned durable reconcile queues. A hand-edited file drops them and reconciles in full. */
+  reconcile?: RunReconcileProgress;
+  /** SHA-256 of the run without this field; detects edits that make `reconcile` stale. */
+  reconcileChecksum?: string;
+  /** Version of the canonical run shape covered by `reconcileChecksum`. */
+  reconcileChecksumVersion?: typeof RUN_RECONCILE_CHECKSUM_VERSION;
   createdAt: string;
   updatedAt: string;
 }

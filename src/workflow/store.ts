@@ -1,10 +1,11 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { z } from 'zod';
-import { readFileSafe, writeJsonAtomic } from '../utils/fs.js';
+import { readFileSafe, writeFileAtomic } from '../utils/fs.js';
 import { getDataHome, type LocalConfig } from '../types.js';
 import { ArchivedPassSchema, StepStateSchema } from './step-state.js';
-import type { RunState, WorkflowDefinition } from './types.js';
+import { indexReconcile } from './scope.js';
+import { RUN_RECONCILE_CHECKSUM_VERSION, RUN_RECONCILE_VERSION, type RunState, type WorkflowDefinition } from './types.js';
 
 /**
  * Run ids: `r` + 16 hex digits. Records are a team-wide key on the reports
@@ -13,6 +14,13 @@ import type { RunState, WorkflowDefinition } from './types.js';
  * The legacy 8-hex form still resolves for runs created before the switch.
  */
 const RUN_ID = /^r[0-9a-f]{8}(?:[0-9a-f]{8})?$/;
+const RECONCILE_CHECKSUM_ALGORITHM = 'sha256';
+
+/** The engine-owned checksum excludes itself, so it is stable across a write and its following read. */
+function reconcileChecksum(run: RunState): string {
+  const { reconcileChecksum: _stored, ...value } = run;
+  return createHash(RECONCILE_CHECKSUM_ALGORITHM).update(JSON.stringify(value)).digest('hex');
+}
 
 export function isRunId(runId: string): boolean {
   return RUN_ID.test(runId);
@@ -61,19 +69,56 @@ const RunProgressSchema = z.object({
   round: z.number().int().optional(),
 });
 
+const ReconcileProgressSchema = z.object({
+  version: z.literal(RUN_RECONCILE_VERSION),
+  fanOuts: z.record(z.object({
+    queue: z.array(z.string()),
+    queued: z.record(z.literal(true)),
+    remaining: z.number().int().nonnegative(),
+  })),
+});
+
+function hasCurrentReconcileShape(run: RunState): boolean {
+  if (run.reconcile === undefined) return true;
+  if (!run.reconcile || typeof run.reconcile !== 'object') return false;
+  return run.reconcile.version === RUN_RECONCILE_VERSION
+    && !!run.reconcile.fanOuts && typeof run.reconcile.fanOuts === 'object' && !Array.isArray(run.reconcile.fanOuts);
+}
+
 export async function readRun(config: LocalConfig, runId: string): Promise<RunState | 'missing' | 'corrupt'> {
   const raw = await readFileSafe(runFilePath(config, runId));
   if (raw === null) return 'missing';
   try {
     const value: unknown = JSON.parse(raw);
     if (!isRunState(value)) return 'corrupt';
+    const checksumValid = typeof value.reconcileChecksum === 'string' && value.reconcileChecksum === reconcileChecksum(value);
+    if (checksumValid && value.reconcileChecksumVersion === RUN_RECONCILE_CHECKSUM_VERSION && hasCurrentReconcileShape(value)) {
+      if (value.reconcile) indexReconcile(value);
+      return value;
+    }
     const progress = RunProgressSchema.safeParse(value);
-    return progress.success ? { ...value, ...progress.data } : 'corrupt';
+    if (!progress.success) return 'corrupt';
+    const { reconcile: _stale, reconcileChecksum: _checksum, reconcileChecksumVersion: _checksumVersion, ...rest } = value;
+    const normalized: RunState = { ...rest, ...progress.data };
+    return normalized;
   } catch {
     return 'corrupt';
   }
 }
 
+/** Canonicalizes an externally supplied run before persisting engine-owned metadata. */
 export async function writeRun(config: LocalConfig, run: RunState): Promise<void> {
-  await writeJsonAtomic(runFilePath(config, run.id), run);
+  const progress = RunProgressSchema.parse(run);
+  const reconcile = run.reconcile === undefined ? undefined : ReconcileProgressSchema.parse(run.reconcile);
+  const { reconcile: _rawReconcile, reconcileChecksum: _checksum, reconcileChecksumVersion: _checksumVersion, ...rest } = run;
+  await writeEngineRun(config, { ...rest, ...progress, ...(reconcile ? { reconcile } : {}) });
+}
+
+/** Writes a run produced by `readRun` and mutated only through the engine's typed transitions. */
+export async function writeEngineRun(config: LocalConfig, run: RunState): Promise<void> {
+  run.cancelledAttempts ??= [];
+  run.archive ??= [];
+  run.reconcileChecksumVersion = RUN_RECONCILE_CHECKSUM_VERSION;
+  run.reconcileChecksum = reconcileChecksum(run);
+  await writeFileAtomic(runFilePath(config, run.id), `${JSON.stringify(run)}\n`);
 }

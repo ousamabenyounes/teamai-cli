@@ -22,6 +22,7 @@ export function itemsOf(run: RunState, state: StepState): StepState[] {
 /** Adds an instance per item right after the `for_each` step, each after every archived pass of its id. */
 export function addItems(run: RunState, state: StepState, items: unknown[]): void {
   const at = run.steps.indexOf(state) + 1;
+  delete run.reconcile;
   run.steps = [...run.steps.slice(0, at), ...items.map((item, index): StepState => {
     const id = `${state.id}[${index}]`;
     const pass = firstPass(run, id);

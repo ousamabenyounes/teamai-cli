@@ -223,6 +223,7 @@ export function archiveUnder(run: RunState, path: string): void {
     const current = passOf(state);
     for (const pass of [...state.passes ?? [], ...(current ? [current] : [])]) (run.archive ??= []).push({ step: state.id, ...pass });
   }
+  delete run.reconcile;
   run.steps = run.steps.filter((state) => !isUnder(state));
 }
 

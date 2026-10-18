@@ -73,6 +73,40 @@ export function stepDefinitions(run: RunState): (path: string) => WorkflowStep |
 
 /** For each `run.steps` array, its instances by the prefix of the scope they are directly inside. */
 const scopeIndex = new WeakMap<readonly StepState[], Map<string, StepState[]>>();
+const positionIndex = new WeakMap<RunState, Record<string, number>>();
+
+/** Builds the process-local id index for a reconciled array. */
+export function indexReconcile(run: RunState): void {
+  positionIndex.set(run, Object.fromEntries(run.steps.map((step, position) => [step.id, position])));
+}
+
+function reconcilePositions(run: RunState): Record<string, number> {
+  let positions = positionIndex.get(run);
+  if (!positions) {
+    indexReconcile(run);
+    positions = positionIndex.get(run)!;
+  }
+  return positions;
+}
+
+export function indexedPosition(run: RunState, id: string): number | undefined {
+  return reconcilePositions(run)[id];
+}
+
+/** A step by id from the durable index, or undefined when the index is absent or stale. */
+export function indexedState(run: RunState, id: string): StepState | undefined {
+  if (!run.reconcile) return undefined;
+  const position = indexedPosition(run, id);
+  if (position === undefined) return undefined;
+  const state = run.steps[position];
+  return state?.id === id ? state : undefined;
+}
+
+/** Array-shape changes invalidate every persisted position and fan-out queue. */
+export function invalidateReconcile(run: RunState): void {
+  positionIndex.delete(run);
+  delete run.reconcile;
+}
 
 /** `states` by the prefix of the scope each is directly inside, in their order. A `for_each` item such as `build[0]` is in none. */
 function byScope(states: readonly StepState[]): Map<string, StepState[]> {
@@ -89,6 +123,11 @@ function byScope(states: readonly StepState[]): Map<string, StepState[]> {
 
 /** The step instances directly inside a scope, in declaration order. A `for_each` item such as `build[0]` is not one. */
 export function statesIn(run: RunState, scope: Scope): StepState[] {
+  if (run.reconcile) {
+    const states = scope.definition.steps.map((step) => indexedState(run, `${scope.prefix}${step.id}`));
+    if (states.every((state): state is StepState => state !== undefined)) return states;
+    invalidateReconcile(run);
+  }
   let index = scopeIndex.get(run.steps);
   if (!index) {
     index = byScope(run.steps);
@@ -104,6 +143,7 @@ export function statesIn(run: RunState, scope: Scope): StepState[] {
 export function insertChildren(run: RunState, runner: StepState, children: StepState[]): void {
   const old = run.steps;
   const at = old.indexOf(runner) + 1;
+  invalidateReconcile(run);
   run.steps = [...old.slice(0, at), ...children, ...old.slice(at)];
   const index = scopeIndex.get(old);
   if (!index) return;
